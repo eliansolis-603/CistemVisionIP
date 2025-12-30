@@ -64,7 +64,7 @@ def draw_rounded_rect(img, pt1, pt2, color, thickness, r, d):
 
 
 # --- CONFIGURACIÓN ---
-RTSP_URL = 'rtsp://nixlab:Nix2022@192.168.100.8/stream1'
+RTSP_URL = 'rtsp://nixlab:Nix2022@192.168.100.5/stream1'
 MODEL_PATH = 'yolov8n.pt'
 
 # Carpetas

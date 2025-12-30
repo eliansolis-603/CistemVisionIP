@@ -7,9 +7,10 @@ from datetime import datetime
 from collections import defaultdict
 from threading import Thread
 import time
+import math
 
 
-# --- CLASE PARA LECTURA DE CÁMARA EN HILO (NO TOCAR) ---
+# --- CLASE PARA LECTURA DE CÁMARA EN HILO ---
 class CameraStream:
     def __init__(self, rtsp_url, name):
         self.rtsp_url = rtsp_url
@@ -37,7 +38,7 @@ class CameraStream:
         self.stopped = True
 
 
-# --- FUNCIÓN GRÁFICA: RECTÁNGULO REDONDEADO ---
+# --- FUNCIÓN ESTÉTICA ---
 def draw_rounded_rect(img, pt1, pt2, color, thickness, r, d):
     x1, y1 = pt1
     x2, y2 = pt2
@@ -53,60 +54,65 @@ def draw_rounded_rect(img, pt1, pt2, color, thickness, r, d):
     cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, color, thickness)
 
 
-# --- CONFIGURACIÓN GENERAL ---
-# Definimos las cámaras con un nombre amigable
+# --- CONFIGURACIÓN DE LAS 7 CÁMARAS ---
+# He renombrado los IDs duplicados para evitar errores en los diccionarios
 CAMERAS_CONFIG = [
     {"id": "Taller", "ip": "192.168.100.5"},
     {"id": "Almacen", "ip": "192.168.100.8"},
-    {"id": "Atrás", "ip": "192.168.100.4"},
-    {"id": "Atrás", "ip": "192.168.100.45"},
+    {"id": "Atras_1", "ip": "192.168.100.4"},
+    {"id": "Atras_2", "ip": "192.168.100.45"},
     {"id": "Plasma", "ip": "192.168.100.6"},
     {"id": "Acceso", "ip": "192.168.100.14"},
     {"id": "Aula", "ip": "192.168.100.10"}
 ]
+
 BASE_RTSP = "rtsp://nixlab:Nix2022@{}/stream1"
 
-# Carpetas y CSV
+# Modelo (Usa .engine en Jetson para soporte de 7 cámaras)
+# MODEL_FILE = 'yolov8n.engine'
+MODEL_FILE = 'yolov8n.pt'  # Cámbialo a .engine en tu Jetson
+
+# Carpetas
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "TapoControl_Multi")
 if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-CSV_SUMMARY = os.path.join(OUTPUT_DIR, "registro_multicamara.csv")
+CSV_SUMMARY = os.path.join(OUTPUT_DIR, "registro_7camaras.csv")
 
 if not os.path.exists(CSV_SUMMARY):
     with open(CSV_SUMMARY, 'w', newline='') as f:
         csv.writer(f).writerow(["Camara", "ID_Persona", "Fecha", "Hora", "Evento", "Estancia_Seg"])
 
-# --- INICIALIZACIÓN DE MODELOS Y STREAMS ---
+# --- INICIALIZACIÓN ---
 streams = []
-models = {}  # Diccionario de modelos independientes
-track_histories = {}  # Diccionario de historiales independientes
+models = {}
+track_histories = {}
 people_records = {}
-crossed_ids = {}  # Diccionario de IDs cruzados por cámara
+crossed_ids = {}
 
-print("Inicializando sistema multicámara...")
+print(f"Cargando {len(CAMERAS_CONFIG)} cámaras. Esto puede tardar unos segundos...")
 
 for cam_conf in CAMERAS_CONFIG:
     url = BASE_RTSP.format(cam_conf["ip"])
     cam_name = cam_conf["id"]
 
-    # 1. Iniciar Stream en hilo
-    print(f"Conectando a {cam_name} ({cam_conf['ip']})...")
+    # Iniciar Stream
+    print(f" -> Conectando {cam_name}...")
     s = CameraStream(url, cam_name).start()
     streams.append(s)
 
-    # 2. Cargar modelo independiente para esta cámara (para no mezclar tracking)
-    # YOLOv8 Nano es ligero, cargar 4 instancias es viable en RAM (aprox 200MB total)
-    models[cam_name] = YOLO('yolov8n.pt')
+    # Cargar Modelo Independiente
+    models[cam_name] = YOLO(MODEL_FILE)
 
-    # 3. Inicializar estructuras de memoria para esta cámara
+    # Memoria
     track_histories[cam_name] = defaultdict(lambda: [])
     people_records[cam_name] = {}
     crossed_ids[cam_name] = set()
 
-time.sleep(2.0)  # Esperar a que todos los streams estabilicen buffer
-print("¡Sistema Operativo! Presiona 'q' para salir.")
+time.sleep(3.0)  # Esperar estabilización de buffers
+print("¡SISTEMA ACTIVO!")
 
-# Dimensiones para el grid (reducimos un poco para que quepan 4 en pantalla)
-FRAME_W, FRAME_H = 640, 360
+# Dimensiones de cada "miniatura" en el grid
+# Reducimos tamaño para que quepan 7 en pantalla sin explotar la resolución
+TILE_W, TILE_H = 480, 270
 
 while True:
     processed_frames = []
@@ -115,22 +121,22 @@ while True:
         frame = stream.read()
         cam_name = stream.name
 
-        # Si una cámara falla, mostramos cuadro negro con aviso
         if frame is None:
-            blank = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
-            cv2.putText(blank, f"SIN SENAL: {cam_name}", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Cuadro de error si falla la señal
+            blank = np.zeros((TILE_H, TILE_W, 3), np.uint8)
+            cv2.putText(blank, f"OFF: {cam_name}", (20, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             processed_frames.append(blank)
             continue
 
-        # Redimensionar para uniformidad en el Grid
-        frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+        # Resize temprano para mejorar rendimiento de dibujo y grid
+        frame = cv2.resize(frame, (TILE_W, TILE_H))
 
-        # Línea de control (Vertical al 50%)
-        line_x = int(FRAME_W * 0.5)
-        cv2.line(frame, (line_x, 0), (line_x, FRAME_H), (100, 100, 100), 1)
+        # Línea de control (Ajustada al nuevo tamaño)
+        line_x = int(TILE_W * 0.5)
+        cv2.line(frame, (line_x, 0), (line_x, TILE_H), (100, 100, 100), 1)
 
-        # --- INFERENCIA CON EL MODELO ESPECÍFICO DE ESTA CÁMARA ---
-        # conf=0.5 filtra detecciones dudosas
+        # Inferencia
+        # imgsz=320 es CRÍTICO para 7 cámaras. No lo subas a 640.
         results = models[cam_name].track(frame, persist=True, verbose=False, classes=0, tracker="bytetrack.yaml",
                                          imgsz=320)
 
@@ -141,69 +147,71 @@ while True:
             for box, track_id in zip(boxes, track_ids):
                 x, y, w_box, h_box = box
 
-                # Dibujo Estético
+                # Dibujo
                 tl = (int(x - w_box / 2), int(y - h_box / 2))
                 br = (int(x + w_box / 2), int(y + h_box / 2))
-                draw_rounded_rect(frame, tl, br, (255, 200, 0), 2, 15, 10)
+                draw_rounded_rect(frame, tl, br, (255, 200, 0), 2, 10, 5)
 
-                # Tracking y Lógica
+                # Tracking
                 track = track_histories[cam_name][track_id]
                 track.append((float(x), float(y + h_box / 2)))
                 if len(track) > 15: track.pop(0)
 
-                # Calcular Tiempos
+                # Tiempos
                 if track_id not in people_records[cam_name]:
                     people_records[cam_name][track_id] = datetime.now()
-
                 duration = (datetime.now() - people_records[cam_name][track_id]).total_seconds()
 
-                # Lógica de Cruce (Simplificada para ejemplo)
+                # Cruce de Línea
                 if track_id not in crossed_ids[cam_name] and len(track) > 2:
                     start_x = track[0][0]
                     center_x = float(x)
-
                     event = None
-                    if start_x < line_x and center_x > line_x + 20:
+
+                    # Umbral de cruce ajustado a resolución pequeña (10px)
+                    if start_x < line_x and center_x > line_x + 10:
                         event = "ENTRADA"
-                    elif start_x > line_x and center_x < line_x - 20:
+                    elif start_x > line_x and center_x < line_x - 10:
                         event = "SALIDA"
 
                     if event:
                         crossed_ids[cam_name].add(track_id)
-                        # REGISTRO CSV INCLUYENDO NOMBRE DE CÁMARA
                         with open(CSV_SUMMARY, 'a', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow([cam_name, track_id, datetime.now().strftime("%Y-%m-%d"),
                                              datetime.now().strftime("%H:%M:%S"), event, round(duration, 2)])
 
-                        # Flash visual en pantalla
-                        cv2.circle(frame, (int(x), int(y)), 15, (0, 255, 0) if event == "ENTRADA" else (0, 0, 255), -1)
+                        # Feedback visual
+                        cv2.circle(frame, (int(x), int(y)), 10, (0, 255, 0) if event == "ENTRADA" else (0, 0, 255), -1)
 
                 # Etiqueta
-                cv2.putText(frame, f"ID:{track_id}", (tl[0], tl[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0),
+                cv2.putText(frame, f"ID:{track_id}", (tl[0], tl[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0),
                             1)
 
-        # Nombre de la cámara en pantalla
-        cv2.putText(frame, cam_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # Etiqueta Nombre Cámara
+        cv2.putText(frame, cam_name, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         processed_frames.append(frame)
 
-    # --- MONTAJE DEL GRID 2x2 ---
-    # Aseguramos que tengamos 4 frames (rellenar si falta alguno por error)
-    while len(processed_frames) < 4:
-        processed_frames.append(np.zeros((FRAME_H, FRAME_W, 3), np.uint8))
+    # --- LÓGICA DE GRID PARA 7 CÁMARAS ---
+    # Necesitamos 8 espacios (4 columnas x 2 filas) para que quede parejo
+    # Rellenamos con cuadros negros hasta tener múltiplo de 4
+    while len(processed_frames) < 8:
+        blank_slot = np.zeros((TILE_H, TILE_W, 3), np.uint8)
+        # Opcional: Poner logo de NixLab en los cuadros vacíos
+        cv2.putText(blank_slot, "NIXLAB", (TILE_W // 2 - 50, TILE_H // 2), cv2.FONT_HERSHEY_SIMPLEX, 1, (50, 50, 50), 2)
+        processed_frames.append(blank_slot)
 
-    # Concatenamos: Arriba (0 y 1), Abajo (2 y 3)
-    top_row = np.hstack((processed_frames[0], processed_frames[1]))
-    bot_row = np.hstack((processed_frames[2], processed_frames[3]))
+    # Armamos las filas (4 cámaras por fila)
+    row1 = np.hstack(processed_frames[0:4])
+    row2 = np.hstack(processed_frames[4:8])
 
-    # Grid Final
-    combined_grid = np.vstack((top_row, bot_row))
+    # Armamos el grid final
+    grid = np.vstack((row1, row2))
 
-    cv2.imshow("NIXLAB - CENTRAL DE MONITOREO 4 CAMARAS", combined_grid)
+    cv2.imshow("NIXLAB CCTV - 7 CAMARAS", grid)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Limpieza
 for s in streams: s.stop()
 cv2.destroyAllWindows()
